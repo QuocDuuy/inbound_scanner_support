@@ -1,0 +1,19 @@
+1. Web app chỉ để nhận hàng trong bao
+- quét bao -> 
++ lượng hàng vật lí / lượng hàng thực tế trên hthong (vd: 50/100 total)
+
+
+
+
+quét cái mã -> 
+
+mã pack: TO + 13 kí tự, trường quantity
+mã 
+
+
+
+1. ngày vận chuyển
+2. mã chuyển
+3. tên hàng
+4. số lượng      số/
+
