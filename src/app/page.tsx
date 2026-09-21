@@ -10,6 +10,71 @@ interface BagData {
   expectedCodes: string[];
 }
 
+export interface ParsedManifest {
+  toCode: string;
+  totalOrders: number;
+  packageCodes: string[];
+}
+
+export async function parseManifestExcel(file: File): Promise<ParsedManifest> {
+  const arrayBuffer = await file.arrayBuffer();
+  const wb = XLSX.read(arrayBuffer, { type: 'array' });
+  const ws = wb.Sheets[wb.SheetNames[0]];
+
+  const rows: any[][] = XLSX.utils.sheet_to_json(ws, {header: 1, defval: '' });
+
+  let toCode = '';
+  let totalOrders = 0;
+  let trackingColIndex = -1;
+  let headerRowIndex = -1;
+
+  // 1. Quét tìm metadata (TO Number & Total Orders) và dòng Header
+  for (let r = 0; r < rows.length; r++) {
+    const row = rows[r];
+    const firstCell = String(row[0] || '').trim();
+
+    if (/^TO Number$/i.test(firstCell)) {
+      toCode = String(row[1] || '').trim();
+    } else if (/^Total Orders$/i.test(firstCell)) {
+      totalOrders = parseInt(String(row[1] || '0'), 10);
+    }
+
+    // Tìm dòng header của danh sách kiện (chứa LM Tracking Number)
+    for (let c = 0; c < row.length; c++) {
+      const cellVal = String(row[c] || '').trim();
+      if (/LM Tracking Number|Tracking Number/i.test(cellVal)) {
+        trackingColIndex = c;
+        headerRowIndex = r;
+        break;
+      }
+    }
+
+    if (headerRowIndex !== -1 && toCode && totalOrders > 0) {
+      break;
+    }
+  }
+
+  // 2. Trích xuất toàn bộ mã kiện từ sau dòng header
+  const packageCodes: string[] = [];
+  if (headerRowIndex !== -1 && trackingColIndex !== -1) {
+    for (let r = headerRowIndex + 1; r < rows.length; r++) {
+      const val = String(rows[r][trackingColIndex] || '').trim().toUpperCase();
+      if (val && val.startsWith('SPX')) {
+        packageCodes.push(val);
+      }
+    }
+  }
+
+  return {
+    toCode: toCode || 'TO-UNKNOWN',
+    totalOrders: totalOrders || packageCodes.length,
+    packageCodes: Array.from(new Set(packageCodes)),
+  };
+}
+
+
+
+
 export default function DebaggingApp() {
   const [phase, setPhase] = useState<Phase>('IMPORT_MANIFEST');
   
@@ -55,32 +120,75 @@ export default function DebaggingApp() {
     } catch (_) {}
   };
 
-  // 2. Đọc file Excel xuất từ nút Export List của FMS
+  // Đọc file Excel xuất từ nút Export List của FMS
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
 
-    const data = await file.arrayBuffer();
-    const wb = XLSX.read(data, { type: 'array' });
-    const ws = wb.Sheets[wb.SheetNames[0]];
-    const rows: any[] = XLSX.utils.sheet_to_json(ws, { defval: '' });
+    try {
+      const data = await file.arrayBuffer();
+      const wb = XLSX.read(data, { type: 'array' });
+      const ws = wb.Sheets[wb.SheetNames[0]];
 
-    if (rows.length === 0) return alert('File không có dữ liệu');
+      // Đọc toàn bộ sheet thành mảng 2 chiều theo từng dòng
+      const rows: any[][] = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '' });
 
-    // Tìm cột SPX Tracking Number theo đúng giao diện FMS
-    const headers = Object.keys(rows[0]);
-    const trackingCol = headers.find((h) =>
-      /spx tracking number|tracking number|waybill/i.test(h)
-    ) || headers[0];
+      if (rows.length === 0) return alert('File không có dữ liệu');
 
-    const codes = rows
-      .map((r) => String(r[trackingCol] || '').trim().toUpperCase())
-      .filter((c) => c.startsWith('SPX') || c.length >= 8);
+      let detectedTO = '';
+      let trackingColIndex = -1;
+      let headerRowIndex = -1;
 
-    if (codes.length === 0) return alert('Không tìm thấy mã SPX Tracking Number hợp lệ!');
+      // 1. Quét tìm TO Number và vị trí cột "LM Tracking Number"
+      for (let r = 0; r < rows.length; r++) {
+        const row = rows[r];
+        const firstCell = String(row[0] || '').trim();
 
-    setAllPackages(codes);
-    setPhase('SCAN_BAG');
+        // Lấy mã TO Number ở ô B bên cạnh
+        if (/^TO Number$/i.test(firstCell) && !detectedTO) {
+          detectedTO = String(row[1] || '').trim();
+        }
+
+        // Tìm dòng tiêu đề của bảng kiện
+        for (let c = 0; c < row.length; c++) {
+          const cellVal = String(row[c] || '').trim();
+          if (/LM Tracking Number|Tracking Number/i.test(cellVal)) {
+            trackingColIndex = c;
+            headerRowIndex = r;
+            break;
+          }
+        }
+
+        if (headerRowIndex !== -1 && detectedTO) break;
+      }
+
+      // 2. Thu thập toàn bộ các mã SPXVN từ dòng header trở xuống
+      const codes: string[] = [];
+      if (headerRowIndex !== -1 && trackingColIndex !== -1) {
+        for (let r = headerRowIndex + 1; r < rows.length; r++) {
+          const val = String(rows[r][trackingColIndex] || '').trim().toUpperCase();
+          if (val && val.startsWith('SPX')) {
+            codes.push(val);
+          }
+        }
+      }
+
+      if (codes.length === 0) {
+        return alert('Không tìm thấy danh sách mã SPXVN trong file!');
+      }
+
+      // Lưu lại danh sách mã và mã TO
+      const uniqueCodes = Array.from(new Set(codes));
+      setAllPackages(uniqueCodes);
+      if (detectedTO) {
+        setCurrentBagCode(detectedTO);
+      }
+
+      setPhase('SCAN_BAG');
+    } catch (err) {
+      console.error(err);
+      alert('Lỗi khi đọc file Excel. Vui lòng thử lại!');
+    }
   };
 
   // 3. Xử lý quét mã bao
