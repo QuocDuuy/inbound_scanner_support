@@ -5,88 +5,28 @@ import * as XLSX from 'xlsx';
 
 type Phase = 'IMPORT_MANIFEST' | 'SCAN_BAG' | 'SCAN_ITEMS' | 'REPORT';
 
-interface BagData {
-  bagCode: string;
-  expectedCodes: string[];
-}
-
 export interface ParsedManifest {
   toCode: string;
   totalOrders: number;
   packageCodes: string[];
 }
 
-export async function parseManifestExcel(file: File): Promise<ParsedManifest> {
-  const arrayBuffer = await file.arrayBuffer();
-  const wb = XLSX.read(arrayBuffer, { type: 'array' });
-  const ws = wb.Sheets[wb.SheetNames[0]];
-
-  const rows: any[][] = XLSX.utils.sheet_to_json(ws, {header: 1, defval: '' });
-
-  let toCode = '';
-  let totalOrders = 0;
-  let trackingColIndex = -1;
-  let headerRowIndex = -1;
-
-  // 1. Quét tìm metadata (TO Number & Total Orders) và dòng Header
-  for (let r = 0; r < rows.length; r++) {
-    const row = rows[r];
-    const firstCell = String(row[0] || '').trim();
-
-    if (/^TO Number$/i.test(firstCell)) {
-      toCode = String(row[1] || '').trim();
-    } else if (/^Total Orders$/i.test(firstCell)) {
-      totalOrders = parseInt(String(row[1] || '0'), 10);
-    }
-
-    // Tìm dòng header của danh sách kiện (chứa LM Tracking Number)
-    for (let c = 0; c < row.length; c++) {
-      const cellVal = String(row[c] || '').trim();
-      if (/LM Tracking Number|Tracking Number/i.test(cellVal)) {
-        trackingColIndex = c;
-        headerRowIndex = r;
-        break;
-      }
-    }
-
-    if (headerRowIndex !== -1 && toCode && totalOrders > 0) {
-      break;
-    }
-  }
-
-  // 2. Trích xuất toàn bộ mã kiện từ sau dòng header
-  const packageCodes: string[] = [];
-  if (headerRowIndex !== -1 && trackingColIndex !== -1) {
-    for (let r = headerRowIndex + 1; r < rows.length; r++) {
-      const val = String(rows[r][trackingColIndex] || '').trim().toUpperCase();
-      if (val && val.startsWith('SPX')) {
-        packageCodes.push(val);
-      }
-    }
-  }
-
-  return {
-    toCode: toCode || 'TO-UNKNOWN',
-    totalOrders: totalOrders || packageCodes.length,
-    packageCodes: Array.from(new Set(packageCodes)),
-  };
-}
-
-
-
-
 export default function DebaggingApp() {
   const [phase, setPhase] = useState<Phase>('IMPORT_MANIFEST');
-  
+
   // Dữ liệu bao và kiện
   const [allPackages, setAllPackages] = useState<string[]>([]);
   const [currentBagCode, setCurrentBagCode] = useState<string>('');
-  
-  // Sets kiểm soát kiện đã quét
-  const expectedSetRef = useRef<Set<string>>(new Set());
+
+  // Dùng useState thay cho useRef để tránh lỗi "Cannot access refs during render"
+  const [expectedSet, setExpectedSet] = useState<Set<string>>(new Set());
   const [scannedSet, setScannedSet] = useState<Set<string>>(new Set());
   const [extraSet, setExtraSet] = useState<Set<string>>(new Set());
-  
+
+  // Input nhập tay cho trường hợp test trên máy tính / không có máy quét
+  const [manualInput, setManualInput] = useState('');
+  const inputRef = useRef<HTMLInputElement>(null);
+
   // Lịch sử quét gần nhất
   const [recentScans, setRecentScans] = useState<
     Array<{ code: string; type: 'VALID' | 'EXTRA' | 'DUPLICATE'; time: string }>
@@ -95,7 +35,8 @@ export default function DebaggingApp() {
   // 1. Âm thanh Web Audio API
   const playTone = (type: 'success' | 'warn' | 'error') => {
     try {
-      const ctx = new (window.AudioContext || (window as any).webkitAudioContext)();
+      const AudioCtx = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+      const ctx = new AudioCtx();
       const osc = ctx.createOscillator();
       const gain = ctx.createGain();
       osc.connect(gain);
@@ -117,10 +58,12 @@ export default function DebaggingApp() {
         osc.start();
         osc.stop(ctx.currentTime + 0.3);
       }
-    } catch (_) {}
+    } catch {
+      // Bỏ qua lỗi audio nếu trình duyệt chặn autoplay
+    }
   };
 
-  // Đọc file Excel xuất từ nút Export List của FMS
+  // 2. Đọc file Excel xuất từ nút Export List của FMS
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
@@ -130,26 +73,27 @@ export default function DebaggingApp() {
       const wb = XLSX.read(data, { type: 'array' });
       const ws = wb.Sheets[wb.SheetNames[0]];
 
-      // Đọc toàn bộ sheet thành mảng 2 chiều theo từng dòng
-      const rows: any[][] = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '' });
+      // Ép kiểu mảng 2 chiều không dùng any
+      const rows = XLSX.utils.sheet_to_json<unknown[]>(ws, { header: 1, defval: '' });
 
-      if (rows.length === 0) return alert('File không có dữ liệu');
+      if (rows.length === 0) {
+        alert('File không có dữ liệu');
+        return;
+      }
 
       let detectedTO = '';
       let trackingColIndex = -1;
       let headerRowIndex = -1;
 
-      // 1. Quét tìm TO Number và vị trí cột "LM Tracking Number"
+      // Quét tìm TO Number và vị trí cột "LM Tracking Number"
       for (let r = 0; r < rows.length; r++) {
         const row = rows[r];
         const firstCell = String(row[0] || '').trim();
 
-        // Lấy mã TO Number ở ô B bên cạnh
         if (/^TO Number$/i.test(firstCell) && !detectedTO) {
           detectedTO = String(row[1] || '').trim();
         }
 
-        // Tìm dòng tiêu đề của bảng kiện
         for (let c = 0; c < row.length; c++) {
           const cellVal = String(row[c] || '').trim();
           if (/LM Tracking Number|Tracking Number/i.test(cellVal)) {
@@ -162,7 +106,7 @@ export default function DebaggingApp() {
         if (headerRowIndex !== -1 && detectedTO) break;
       }
 
-      // 2. Thu thập toàn bộ các mã SPXVN từ dòng header trở xuống
+      // Thu thập toàn bộ các mã SPXVN từ dòng header trở xuống
       const codes: string[] = [];
       if (headerRowIndex !== -1 && trackingColIndex !== -1) {
         for (let r = headerRowIndex + 1; r < rows.length; r++) {
@@ -174,10 +118,10 @@ export default function DebaggingApp() {
       }
 
       if (codes.length === 0) {
-        return alert('Không tìm thấy danh sách mã SPXVN trong file!');
+        alert('Không tìm thấy danh sách mã SPXVN trong file!');
+        return;
       }
 
-      // Lưu lại danh sách mã và mã TO
       const uniqueCodes = Array.from(new Set(codes));
       setAllPackages(uniqueCodes);
       if (detectedTO) {
@@ -185,8 +129,7 @@ export default function DebaggingApp() {
       }
 
       setPhase('SCAN_BAG');
-    } catch (err) {
-      console.error(err);
+    } catch {
       alert('Lỗi khi đọc file Excel. Vui lòng thử lại!');
     }
   };
@@ -197,7 +140,7 @@ export default function DebaggingApp() {
     if (!cleanBag) return;
 
     setCurrentBagCode(cleanBag);
-    expectedSetRef.current = new Set(allPackages);
+    setExpectedSet(new Set(allPackages));
     setScannedSet(new Set());
     setExtraSet(new Set());
     setRecentScans([]);
@@ -205,7 +148,7 @@ export default function DebaggingApp() {
     playTone('success');
   };
 
-  // 4. Xử lý khi bóp cò quét từng kiện nhỏ
+  // 4. Xử lý khi quét hoặc nhập từng mã kiện
   const handleItemScan = (rawCode: string) => {
     const code = rawCode.trim().toUpperCase();
     if (!code || code.length < 5) return;
@@ -214,30 +157,42 @@ export default function DebaggingApp() {
     // Quét trùng
     if (scannedSet.has(code) || extraSet.has(code)) {
       playTone('warn');
-      setRecentScans((prev) => [{ code, type: 'DUPLICATE', time }, ...prev.slice(0, 5)]);
+      setRecentScans((prev) => [{ code, type: 'DUPLICATE', time }, ...prev.slice(0, 7)]);
       return;
     }
 
     // Kiện nằm trong bao
-    if (expectedSetRef.current.has(code)) {
+    if (expectedSet.has(code)) {
       playTone('success');
       setScannedSet((prev) => new Set(prev).add(code));
-      setRecentScans((prev) => [{ code, type: 'VALID', time }, ...prev.slice(0, 5)]);
+      setRecentScans((prev) => [{ code, type: 'VALID', time }, ...prev.slice(0, 7)]);
       return;
     }
 
     // Kiện lạ ngoài bao
     playTone('error');
     setExtraSet((prev) => new Set(prev).add(code));
-    setRecentScans((prev) => [{ code, type: 'EXTRA', time }, ...prev.slice(0, 5)]);
+    setRecentScans((prev) => [{ code, type: 'EXTRA', time }, ...prev.slice(0, 7)]);
   };
 
-  // Global listener bắt mã quét từ máy PDA
+  // Xử lý submit ô nhập tay
+  const handleManualSubmit = (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
+    if (!manualInput.trim()) return;
+
+    handleItemScan(manualInput.trim());
+    setManualInput('');
+    setTimeout(() => inputRef.current?.focus(), 50);
+  };
+
+  // Global listener bắt sự kiện máy quét PDA (bỏ qua khi đang trỏ vào input)
   useEffect(() => {
     let buffer = '';
     let lastTime = Date.now();
 
     const onKeyDown = (e: KeyboardEvent) => {
+      if (document.activeElement?.tagName === 'INPUT') return;
+
       const now = Date.now();
       if (now - lastTime > 60) buffer = '';
       lastTime = now;
@@ -258,14 +213,16 @@ export default function DebaggingApp() {
 
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [phase, scannedSet, extraSet, allPackages]);
+  }, [phase, scannedSet, extraSet, allPackages, expectedSet]);
 
   // ==================== BƯỚC 1: NẠP FILE EXCEL TỪ FMS ====================
   if (phase === 'IMPORT_MANIFEST') {
     return (
       <main className="min-h-screen bg-slate-950 text-white p-4 flex flex-col justify-center max-w-md mx-auto">
         <h1 className="text-xl font-bold text-emerald-400 mb-1">Inbound FMS SPX</h1>
-        <p className="text-xs text-slate-400 mb-4">Tải file danh sách kiện xuất từ nút "Export List" trên FMS</p>
+        <p className="text-xs text-slate-400 mb-4">
+          Tải file danh sách kiện xuất từ nút &quot;Export List&quot; trên FMS
+        </p>
 
         <div className="border-2 border-dashed border-slate-700 rounded-xl p-8 text-center bg-slate-900">
           <label className="cursor-pointer block">
@@ -293,7 +250,8 @@ export default function DebaggingApp() {
 
           <input
             id="bagInput"
-            placeholder="Chờ máy quét mã bao..."
+            placeholder="Chờ máy quét hoặc nhập mã bao..."
+            defaultValue={currentBagCode}
             className="w-full bg-slate-900 border border-emerald-500/50 rounded-lg p-3 text-center text-sm font-mono tracking-wider outline-none mb-3"
             onKeyDown={(e) => {
               if (e.key === 'Enter') handleBagScanConfirm((e.target as HTMLInputElement).value);
@@ -301,7 +259,7 @@ export default function DebaggingApp() {
           />
 
           <button
-            onClick={() => handleBagScanConfirm('TO-DEFAULT')}
+            onClick={() => handleBagScanConfirm(currentBagCode || 'TO-DEFAULT')}
             className="text-xs text-slate-400 underline hover:text-white"
           >
             Bỏ qua bước quét bao, kiểm đếm ngay
@@ -311,8 +269,8 @@ export default function DebaggingApp() {
     );
   }
 
-  // ==================== BƯỚC 3: QUÉT KIỆN CON (450 / 500) ====================
-  const totalExpected = expectedSetRef.current.size;
+  // ==================== BƯỚC 3: QUÉT HOẶC NHẬP KIỆN CON ====================
+  const totalExpected = expectedSet.size;
   const matchedCount = scannedSet.size;
   const missingCount = Math.max(0, totalExpected - matchedCount);
 
@@ -324,7 +282,7 @@ export default function DebaggingApp() {
           <div className="text-xs text-slate-400 font-mono flex justify-between">
             <span>Bao: {currentBagCode}</span>
             <span className="text-emerald-400 font-bold">
-              {Math.round((matchedCount / totalExpected) * 100) || 0}%
+              {totalExpected > 0 ? Math.round((matchedCount / totalExpected) * 100) : 0}%
             </span>
           </div>
 
@@ -346,10 +304,29 @@ export default function DebaggingApp() {
           </div>
         </header>
 
+        {/* Ô nhập tay test trên máy tính */}
+        <form onSubmit={handleManualSubmit} className="p-2.5 bg-slate-900 border-b border-slate-800 flex gap-2">
+          <input
+            ref={inputRef}
+            type="text"
+            value={manualInput}
+            onChange={(e) => setManualInput(e.target.value)}
+            placeholder="Nhập hoặc dán mã SPXVN... rồi Enter"
+            className="flex-1 bg-slate-950 border border-emerald-500/50 rounded-lg px-3 py-2 text-xs font-mono text-white outline-none focus:border-emerald-400"
+            autoFocus
+          />
+          <button
+            type="submit"
+            className="bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs px-4 py-2 rounded-lg transition-colors whitespace-nowrap"
+          >
+            Nhập
+          </button>
+        </form>
+
         {/* Lịch sử quét gần nhất */}
         <main className="flex-1 overflow-y-auto p-3 space-y-2">
           {recentScans.length === 0 && (
-            <div className="text-center text-slate-600 text-xs py-10">Bắn mã kiện SPX để kiểm...</div>
+            <div className="text-center text-slate-600 text-xs py-10">Bắn mã kiện hoặc nhập tay để kiểm...</div>
           )}
 
           {recentScans.map((item, idx) => (
@@ -397,7 +374,7 @@ export default function DebaggingApp() {
 
   // ==================== BƯỚC 4: BÁO CÁO ĐỐI SOÁT ====================
   const missingList: string[] = [];
-  expectedSetRef.current.forEach((c) => {
+  expectedSet.forEach((c) => {
     if (!scannedSet.has(c)) missingList.push(c);
   });
 
