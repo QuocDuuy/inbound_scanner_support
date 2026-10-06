@@ -5,32 +5,41 @@ import * as XLSX from 'xlsx';
 
 type Phase = 'IMPORT_MANIFEST' | 'SCAN_BAG' | 'SCAN_ITEMS' | 'REPORT';
 
-export interface ParsedManifest {
+interface BagDetail {
   toCode: string;
-  totalOrders: number;
-  packageCodes: string[];
+  expectedCodes: string[];
+}
+
+interface ScanRecord {
+  code: string;
+  type: 'VALID' | 'MISPLACED' | 'EXTRA' | 'DUPLICATE';
+  targetBag?: string; // Bao chính xác của kiện này (nếu bị lạc bao)
+  time: string;
 }
 
 export default function DebaggingApp() {
   const [phase, setPhase] = useState<Phase>('IMPORT_MANIFEST');
 
-  // Dữ liệu bao và kiện
-  const [allPackages, setAllPackages] = useState<string[]>([]);
+  // Quản lý đa bao
+  const [bagsMap, setBagsMap] = useState<Map<string, string[]>>(new Map());
+  // Bảng tra cứu ngược: Mã kiện -> Mã bao sở hữu
+  const [packageToBagMap, setPackageToBagMap] = useState<Map<string, string>>(new Map());
+
+  // Bao đang thao tác
   const [currentBagCode, setCurrentBagCode] = useState<string>('');
-
-  // Dùng useState thay cho useRef để tránh lỗi "Cannot access refs during render"
   const [expectedSet, setExpectedSet] = useState<Set<string>>(new Set());
-  const [scannedSet, setScannedSet] = useState<Set<string>>(new Set());
-  const [extraSet, setExtraSet] = useState<Set<string>>(new Set());
 
-  // Input nhập tay cho trường hợp test trên máy tính / không có máy quét
+  // Các tập hợp kết quả của bao hiện tại
+  const [scannedSet, setScannedSet] = useState<Set<string>>(new Set());
+  const [misplacedSet, setMisplacedSet] = useState<Map<string, string>>(new Map()); // Mã kiện -> Thuộc bao nào
+  const [extraSet, setExtraSet] = useState<Set<string>>(new Set()); // Kiện lạ không thuộc bất kỳ bao nào
+
+  // Input nhập tay
   const [manualInput, setManualInput] = useState('');
   const inputRef = useRef<HTMLInputElement>(null);
 
   // Lịch sử quét gần nhất
-  const [recentScans, setRecentScans] = useState<
-    Array<{ code: string; type: 'VALID' | 'EXTRA' | 'DUPLICATE'; time: string }>
-  >([]);
+  const [recentScans, setRecentScans] = useState<ScanRecord[]>([]);
 
   // 1. Âm thanh Web Audio API
   const playTone = (type: 'success' | 'warn' | 'error') => {
@@ -59,89 +68,114 @@ export default function DebaggingApp() {
         osc.stop(ctx.currentTime + 0.3);
       }
     } catch {
-      // Bỏ qua lỗi audio nếu trình duyệt chặn autoplay
+      // Trình duyệt chặn autoplay thì bỏ qua
     }
   };
 
-  // 2. Đọc file Excel xuất từ nút Export List của FMS
-  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
+  // 2. Đọc nhiều file Excel FMS cùng một lúc (Multi-file upload)
+  const handleMultipleFilesUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = e.target.files;
+    if (!files || files.length === 0) return;
+
+    const newBagsMap = new Map<string, string[]>();
+    const newPkgMap = new Map<string, string>();
 
     try {
-      const data = await file.arrayBuffer();
-      const wb = XLSX.read(data, { type: 'array' });
-      const ws = wb.Sheets[wb.SheetNames[0]];
+      for (let i = 0; i < files.length; i++) {
+        const file = files[i];
+        const data = await file.arrayBuffer();
+        const wb = XLSX.read(data, { type: 'array' });
+        const ws = wb.Sheets[wb.SheetNames[0]];
+        const rows = XLSX.utils.sheet_to_json<unknown[]>(ws, { header: 1, defval: '' });
 
-      // Ép kiểu mảng 2 chiều không dùng any
-      const rows = XLSX.utils.sheet_to_json<unknown[]>(ws, { header: 1, defval: '' });
+        if (rows.length === 0) continue;
 
-      if (rows.length === 0) {
-        alert('File không có dữ liệu');
-        return;
-      }
+        let detectedTO = '';
+        let trackingColIndex = -1;
+        let headerRowIndex = -1;
 
-      let detectedTO = '';
-      let trackingColIndex = -1;
-      let headerRowIndex = -1;
+        // Quét tìm TO Number và cột LM Tracking Number
+        for (let r = 0; r < rows.length; r++) {
+          const row = rows[r];
+          const firstCell = String(row[0] || '').trim();
 
-      // Quét tìm TO Number và vị trí cột "LM Tracking Number"
-      for (let r = 0; r < rows.length; r++) {
-        const row = rows[r];
-        const firstCell = String(row[0] || '').trim();
+          if (/^TO Number$/i.test(firstCell) && !detectedTO) {
+            detectedTO = String(row[1] || '').trim();
+          }
 
-        if (/^TO Number$/i.test(firstCell) && !detectedTO) {
-          detectedTO = String(row[1] || '').trim();
+          for (let c = 0; c < row.length; c++) {
+            const cellVal = String(row[c] || '').trim();
+            if (/LM Tracking Number|Tracking Number/i.test(cellVal)) {
+              trackingColIndex = c;
+              headerRowIndex = r;
+              break;
+            }
+          }
+
+          if (headerRowIndex !== -1 && detectedTO) break;
         }
 
-        for (let c = 0; c < row.length; c++) {
-          const cellVal = String(row[c] || '').trim();
-          if (/LM Tracking Number|Tracking Number/i.test(cellVal)) {
-            trackingColIndex = c;
-            headerRowIndex = r;
-            break;
+        // Lấy mã bao (hoặc dùng tên file nếu không đọc được dòng TO Number)
+        const bagKey = detectedTO || file.name.replace(/\.[^/.]+$/, '');
+
+        // Trích xuất mã: Chấp nhận cả SPX... và VN...
+        const codes: string[] = [];
+        if (headerRowIndex !== -1 && trackingColIndex !== -1) {
+          for (let r = headerRowIndex + 1; r < rows.length; r++) {
+            const val = String(rows[r][trackingColIndex] || '').trim().toUpperCase();
+            // Regex chấp nhận mã bắt đầu bằng SPX hoặc VN với tối thiểu 8 ký tự
+            if (val && /^(SPX|VN)/i.test(val)) {
+              codes.push(val);
+              newPkgMap.set(val, bagKey);
+            }
           }
         }
 
-        if (headerRowIndex !== -1 && detectedTO) break;
-      }
-
-      // Thu thập toàn bộ các mã SPXVN từ dòng header trở xuống
-      const codes: string[] = [];
-      if (headerRowIndex !== -1 && trackingColIndex !== -1) {
-        for (let r = headerRowIndex + 1; r < rows.length; r++) {
-          const val = String(rows[r][trackingColIndex] || '').trim().toUpperCase();
-          if (val && val.startsWith('SPX')) {
-            codes.push(val);
-          }
+        if (codes.length > 0) {
+          newBagsMap.set(bagKey, Array.from(new Set(codes)));
         }
       }
 
-      if (codes.length === 0) {
-        alert('Không tìm thấy danh sách mã SPXVN trong file!');
+      if (newBagsMap.size === 0) {
+        alert('Không tìm thấy dữ liệu kiện hợp lệ trong các file đã chọn!');
         return;
       }
 
-      const uniqueCodes = Array.from(new Set(codes));
-      setAllPackages(uniqueCodes);
-      if (detectedTO) {
-        setCurrentBagCode(detectedTO);
-      }
-
+      setBagsMap(newBagsMap);
+      setPackageToBagMap(newPkgMap);
       setPhase('SCAN_BAG');
     } catch {
-      alert('Lỗi khi đọc file Excel. Vui lòng thử lại!');
+      alert('Đã xảy ra lỗi khi đọc các file Excel. Vui lòng thử lại!');
     }
   };
 
-  // 3. Xử lý quét mã bao
+  // 3. Quét hoặc chọn mã bao để kích hoạt xả bao
   const handleBagScanConfirm = (bagCodeInput: string) => {
     const cleanBag = bagCodeInput.trim().toUpperCase();
     if (!cleanBag) return;
 
-    setCurrentBagCode(cleanBag);
-    setExpectedSet(new Set(allPackages));
+    // Tìm bao tương ứng trong danh sách đã nạp
+    let matchedBagKey = '';
+    for (const key of bagsMap.keys()) {
+      if (key.toUpperCase() === cleanBag) {
+        matchedBagKey = key;
+        break;
+      }
+    }
+
+    if (!matchedBagKey) {
+      // Trường hợp quét mã bao lạ không nằm trong danh sách file đã nạp
+      const proceed = confirm(`Bao "${cleanBag}" không có trong danh sách file nạp. Bạn có muốn tạo bao trống để kiểm đếm không?`);
+      if (!proceed) return;
+      matchedBagKey = cleanBag;
+      setExpectedSet(new Set());
+    } else {
+      setExpectedSet(new Set(bagsMap.get(matchedBagKey) || []));
+    }
+
+    setCurrentBagCode(matchedBagKey);
     setScannedSet(new Set());
+    setMisplacedSet(new Map());
     setExtraSet(new Set());
     setRecentScans([]);
     setPhase('SCAN_ITEMS');
@@ -154,14 +188,14 @@ export default function DebaggingApp() {
     if (!code || code.length < 5) return;
     const time = new Date().toLocaleTimeString('vi-VN');
 
-    // Quét trùng
-    if (scannedSet.has(code) || extraSet.has(code)) {
+    // Trường hợp 1: Quét trùng (đã quét qua rồi)
+    if (scannedSet.has(code) || misplacedSet.has(code) || extraSet.has(code)) {
       playTone('warn');
       setRecentScans((prev) => [{ code, type: 'DUPLICATE', time }, ...prev.slice(0, 7)]);
       return;
     }
 
-    // Kiện nằm trong bao
+    // Trường hợp 2: Kiện hợp lệ (nằm đúng trong bao hiện tại)
     if (expectedSet.has(code)) {
       playTone('success');
       setScannedSet((prev) => new Set(prev).add(code));
@@ -169,13 +203,25 @@ export default function DebaggingApp() {
       return;
     }
 
-    // Kiện lạ ngoài bao
+    // Trường hợp 3: Kiện lạc bao (Thuộc một bao khác trong cùng lô nạp)
+    const belongingBag = packageToBagMap.get(code);
+    if (belongingBag && belongingBag !== currentBagCode) {
+      playTone('warn');
+      setMisplacedSet((prev) => new Map(prev).set(code, belongingBag));
+      setRecentScans((prev) => [
+        { code, type: 'MISPLACED', targetBag: belongingBag, time },
+        ...prev.slice(0, 7),
+      ]);
+      return;
+    }
+
+    // Trường hợp 4: Kiện lạ hoàn toàn (không thuộc bất kỳ bao nào)
     playTone('error');
     setExtraSet((prev) => new Set(prev).add(code));
     setRecentScans((prev) => [{ code, type: 'EXTRA', time }, ...prev.slice(0, 7)]);
   };
 
-  // Xử lý submit ô nhập tay
+  // Xử lý gửi mã khi gõ tay hoặc paste
   const handleManualSubmit = (e?: React.FormEvent) => {
     if (e) e.preventDefault();
     if (!manualInput.trim()) return;
@@ -185,7 +231,7 @@ export default function DebaggingApp() {
     setTimeout(() => inputRef.current?.focus(), 50);
   };
 
-  // Global listener bắt sự kiện máy quét PDA (bỏ qua khi đang trỏ vào input)
+  // Global listener bắt sự kiện máy quét PDA
   useEffect(() => {
     let buffer = '';
     let lastTime = Date.now();
@@ -213,23 +259,30 @@ export default function DebaggingApp() {
 
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [phase, scannedSet, extraSet, allPackages, expectedSet]);
+  }, [phase, scannedSet, extraSet, misplacedSet, expectedSet, currentBagCode]);
 
-  // ==================== BƯỚC 1: NẠP FILE EXCEL TỪ FMS ====================
+  // ==================== BƯỚC 1: NẠP NHIỀU FILE EXCEL TỪ FMS ====================
   if (phase === 'IMPORT_MANIFEST') {
     return (
       <main className="min-h-screen bg-slate-950 text-white p-4 flex flex-col justify-center max-w-md mx-auto">
         <h1 className="text-xl font-bold text-emerald-400 mb-1">Inbound FMS SPX</h1>
         <p className="text-xs text-slate-400 mb-4">
-          Tải file danh sách kiện xuất từ nút &quot;Export List&quot; trên FMS
+          Tải một hoặc <b>nhiều file Excel</b> xuất từ FMS để tự động nhận diện bao
         </p>
 
         <div className="border-2 border-dashed border-slate-700 rounded-xl p-8 text-center bg-slate-900">
           <label className="cursor-pointer block">
-            <span className="text-sm font-semibold block mb-2">Chọn file Excel (.xlsx)</span>
-            <input type="file" accept=".xlsx,.xls,.csv" onChange={handleFileUpload} className="hidden" />
-            <span className="inline-block bg-emerald-600 hover:bg-emerald-500 text-xs font-bold px-4 py-2 rounded">
-              Tải file manifest
+            <span className="text-sm font-semibold block mb-2">Chọn các file Excel (.xlsx)</span>
+            <span className="text-[11px] text-slate-500 block mb-4">Giữ phím Shift hoặc Ctrl để chọn nhiều file</span>
+            <input
+              type="file"
+              accept=".xlsx,.xls,.csv"
+              multiple
+              onChange={handleMultipleFilesUpload}
+              className="hidden"
+            />
+            <span className="inline-block bg-emerald-600 hover:bg-emerald-500 text-xs font-bold px-4 py-2.5 rounded-lg shadow-lg">
+              Tải lên các file manifest
             </span>
           </label>
         </div>
@@ -237,33 +290,53 @@ export default function DebaggingApp() {
     );
   }
 
-  // ==================== BƯỚC 2: QUÉT MÃ BAO (TO NUMBER) ====================
+  // ==================== BƯỚC 2: QUÉT HOẶC CHỌN MÃ BAO ====================
+  const bagList = Array.from(bagsMap.keys());
+  const totalBagsCount = bagList.length;
+  const totalPackagesAllBags = Array.from(bagsMap.values()).reduce((sum, list) => sum + list.length, 0);
+
   if (phase === 'SCAN_BAG') {
     return (
-      <main className="min-h-screen bg-slate-950 text-white p-4 flex flex-col justify-center max-w-md mx-auto">
-        <div className="text-center">
-          <div className="text-emerald-400 text-xs font-bold mb-2">ĐÃ NẠP {allPackages.length} KIỆN</div>
-          <h2 className="text-2xl font-black mb-3">Quét mã bao lớn</h2>
-          <p className="text-xs text-slate-400 mb-6">
-            Bắn mã QR trên seal hoặc mã <b>TO Number</b> (ví dụ: TO20260912...)
+      <main className="min-h-screen bg-slate-950 text-white p-4 flex flex-col max-w-md mx-auto">
+        <div className="text-center my-auto">
+          <div className="text-emerald-400 text-xs font-bold mb-1">
+            ĐÃ NẠP {totalBagsCount} BAO ({totalPackagesAllBags} KIỆN)
+          </div>
+          <h2 className="text-2xl font-black mb-2">Quét mã bao lớn</h2>
+          <p className="text-xs text-slate-400 mb-4">
+            Bắn mã QR hoặc mã <b>TO Number</b> (ví dụ: TO2026...)
           </p>
 
           <input
             id="bagInput"
             placeholder="Chờ máy quét hoặc nhập mã bao..."
-            defaultValue={currentBagCode}
             className="w-full bg-slate-900 border border-emerald-500/50 rounded-lg p-3 text-center text-sm font-mono tracking-wider outline-none mb-3"
             onKeyDown={(e) => {
               if (e.key === 'Enter') handleBagScanConfirm((e.target as HTMLInputElement).value);
             }}
           />
 
-          <button
-            onClick={() => handleBagScanConfirm(currentBagCode || 'TO-DEFAULT')}
-            className="text-xs text-slate-400 underline hover:text-white"
-          >
-            Bỏ qua bước quét bao, kiểm đếm ngay
-          </button>
+          {/* Danh sách các bao có sẵn để bấm nhanh */}
+          <div className="mt-4 text-left">
+            <span className="text-xs font-semibold text-slate-400 uppercase tracking-wider block mb-2">
+              Hoặc chọn nhanh bao ({totalBagsCount}):
+            </span>
+            <div className="max-h-52 overflow-y-auto space-y-1.5 pr-1">
+              {bagList.map((to) => {
+                const count = bagsMap.get(to)?.length || 0;
+                return (
+                  <button
+                    key={to}
+                    onClick={() => handleBagScanConfirm(to)}
+                    className="w-full flex items-center justify-between p-2.5 bg-slate-900 hover:bg-slate-800 border border-slate-800 rounded-lg text-xs font-mono transition-colors"
+                  >
+                    <span className="font-bold text-slate-200">{to}</span>
+                    <span className="text-emerald-400">{count} kiện</span>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
         </div>
       </main>
     );
@@ -291,7 +364,7 @@ export default function DebaggingApp() {
             <span className="text-2xl text-slate-500 font-normal">/{totalExpected}</span>
           </div>
 
-          <div className="grid grid-cols-3 gap-2 mt-2 text-center text-xs font-bold">
+          <div className="grid grid-cols-4 gap-1.5 mt-2 text-center text-[11px] font-bold">
             <div className="bg-emerald-950/60 border border-emerald-500/30 text-emerald-400 py-1 rounded">
               Khớp: {matchedCount}
             </div>
@@ -299,7 +372,10 @@ export default function DebaggingApp() {
               Thiếu: {missingCount}
             </div>
             <div className="bg-amber-950/60 border border-amber-500/30 text-amber-400 py-1 rounded">
-              Thừa: {extraSet.size}
+              Lạc bao: {misplacedSet.size}
+            </div>
+            <div className="bg-slate-800/80 border border-slate-700 text-slate-300 py-1 rounded">
+              Dư lạ: {extraSet.size}
             </div>
           </div>
         </header>
@@ -311,7 +387,7 @@ export default function DebaggingApp() {
             type="text"
             value={manualInput}
             onChange={(e) => setManualInput(e.target.value)}
-            placeholder="Nhập hoặc dán mã SPXVN... rồi Enter"
+            placeholder="Nhập hoặc dán mã SPX / VN... rồi Enter"
             className="flex-1 bg-slate-950 border border-emerald-500/50 rounded-lg px-3 py-2 text-xs font-mono text-white outline-none focus:border-emerald-400"
             autoFocus
           />
@@ -335,25 +411,42 @@ export default function DebaggingApp() {
               className={`flex items-center justify-between p-2 rounded border text-xs font-mono ${
                 item.type === 'VALID'
                   ? 'bg-slate-900 border-slate-800 text-slate-200'
+                  : item.type === 'MISPLACED'
+                  ? 'bg-amber-950/30 border-amber-700/60 text-amber-300'
                   : item.type === 'EXTRA'
-                  ? 'bg-amber-950/30 border-amber-800/50 text-amber-300'
+                  ? 'bg-rose-950/30 border-rose-800/50 text-rose-300'
                   : 'bg-slate-900 border-slate-800 text-slate-400'
               }`}
             >
               <div>
                 <div className="font-bold">{item.code}</div>
-                <div className="text-[10px] text-slate-500">{item.time}</div>
+                <div className="text-[10px] text-slate-500">
+                  {item.time}
+                  {item.type === 'MISPLACED' && (
+                    <span className="text-amber-400 ml-1.5 font-semibold">
+                      (Thuộc bao: {item.targetBag})
+                    </span>
+                  )}
+                </div>
               </div>
               <span
                 className={`text-[10px] font-bold px-1.5 py-0.5 rounded ${
                   item.type === 'VALID'
                     ? 'bg-emerald-950 text-emerald-400 border border-emerald-800'
+                    : item.type === 'MISPLACED'
+                    ? 'bg-amber-950 text-amber-300 border border-amber-800'
                     : item.type === 'EXTRA'
-                    ? 'bg-amber-950 text-amber-400 border border-amber-800'
+                    ? 'bg-rose-950 text-rose-300 border border-rose-800'
                     : 'bg-slate-800 text-slate-400'
                 }`}
               >
-                {item.type === 'VALID' ? 'Khớp' : item.type === 'EXTRA' ? 'Thừa' : 'Trùng'}
+                {item.type === 'VALID'
+                  ? 'Khớp'
+                  : item.type === 'MISPLACED'
+                  ? 'Lạc bao'
+                  : item.type === 'EXTRA'
+                  ? 'Dư lạ'
+                  : 'Trùng'}
               </span>
             </div>
           ))}
@@ -365,7 +458,7 @@ export default function DebaggingApp() {
             onClick={() => setPhase('REPORT')}
             className="w-full py-3 bg-emerald-600 hover:bg-emerald-500 font-bold text-sm rounded-lg"
           >
-            Chốt bao & Xem lệch
+            Chốt bao & Xem chi tiết lệch
           </button>
         </footer>
       </div>
@@ -378,25 +471,35 @@ export default function DebaggingApp() {
     if (!scannedSet.has(c)) missingList.push(c);
   });
 
+  const misplacedList = Array.from(misplacedSet.entries()); // [mã kiện, thuộc bao nào]
+
   return (
     <div className="min-h-screen bg-slate-950 text-white p-4 max-w-md mx-auto flex flex-col justify-between">
-      <div>
-        <h1 className="text-xl font-bold text-emerald-400 mb-1">Kết quả xả bao: {currentBagCode}</h1>
-        <div className="bg-slate-900 border border-slate-800 rounded-lg p-3 grid grid-cols-3 gap-2 text-center text-xs my-4">
+      <div className="space-y-4">
+        <h1 className="text-xl font-bold text-emerald-400">Kết quả xả bao: {currentBagCode}</h1>
+
+        <div className="bg-slate-900 border border-slate-800 rounded-lg p-3 grid grid-cols-4 gap-1.5 text-center text-xs">
           <div>
-            <div className="text-slate-400">Total</div>
-            <div className="text-lg font-bold font-mono">{totalExpected}</div>
+            <div className="text-slate-400">Dự kiến</div>
+            <div className="text-base font-bold font-mono">{totalExpected}</div>
           </div>
           <div>
             <div className="text-slate-400">Khớp</div>
-            <div className="text-lg font-bold font-mono text-emerald-400">{matchedCount}</div>
+            <div className="text-base font-bold font-mono text-emerald-400">{matchedCount}</div>
           </div>
           <div>
             <div className="text-slate-400">Thiếu</div>
-            <div className="text-lg font-bold font-mono text-rose-400">{missingList.length}</div>
+            <div className="text-base font-bold font-mono text-rose-400">{missingList.length}</div>
+          </div>
+          <div>
+            <div className="text-slate-400">Lạc / Dư</div>
+            <div className="text-base font-bold font-mono text-amber-400">
+              {misplacedList.length + extraSet.size}
+            </div>
           </div>
         </div>
 
+        {/* Danh sách đơn thiếu */}
         {missingList.length > 0 && (
           <div>
             <div className="flex justify-between items-center mb-1">
@@ -411,9 +514,26 @@ export default function DebaggingApp() {
                 Copy
               </button>
             </div>
-            <div className="bg-slate-900 border border-slate-800 rounded p-2 max-h-48 overflow-y-auto text-xs font-mono text-slate-300">
+            <div className="bg-slate-900 border border-slate-800 rounded p-2 max-h-36 overflow-y-auto text-xs font-mono text-slate-300">
               {missingList.map((c) => (
                 <div key={c}>{c}</div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* Danh sách đơn lạc bao */}
+        {misplacedList.length > 0 && (
+          <div>
+            <span className="text-xs text-amber-400 font-bold block mb-1">
+              Kiện quét nhầm từ bao khác ({misplacedList.length})
+            </span>
+            <div className="bg-slate-900 border border-slate-800 rounded p-2 max-h-32 overflow-y-auto text-xs font-mono text-slate-300 space-y-1">
+              {misplacedList.map(([code, targetBag]) => (
+                <div key={code} className="flex justify-between">
+                  <span>{code}</span>
+                  <span className="text-amber-400 font-semibold">Thuộc: {targetBag}</span>
+                </div>
               ))}
             </div>
           </div>
@@ -424,7 +544,7 @@ export default function DebaggingApp() {
         onClick={() => setPhase('SCAN_BAG')}
         className="w-full py-3 bg-emerald-600 hover:bg-emerald-500 font-bold text-sm rounded-lg mt-4"
       >
-        Quét tiếp bao khác
+        Tiếp tục quét bao khác
       </button>
     </div>
   );
